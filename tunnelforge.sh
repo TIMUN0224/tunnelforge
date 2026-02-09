@@ -60,6 +60,7 @@ check_bash_version
 # ============================================================================
 
 readonly VERSION="1.0.0"
+readonly GITHUB_REPO="SamNet-dev/tunnelforge"
 readonly APP_NAME="TunnelForge"
 readonly APP_NAME_LOWER="tunnelforge"
 
@@ -4753,6 +4754,100 @@ uninstall_tunnelforge() {
     return 0
 }
 
+# ── Self-Update ──────────────────────────────────────────────────────────────
+
+update_tunnelforge() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "Update requires root privileges"
+        return 1
+    fi
+
+    printf "\n${BOLD_CYAN}═══ TunnelForge Update ═══${RESET}\n\n" >/dev/tty
+
+    local _script_path="${INSTALL_DIR}/tunnelforge.sh"
+    if [[ ! -f "$_script_path" ]]; then
+        log_error "TunnelForge not installed at ${_script_path}"
+        return 1
+    fi
+
+    # Download latest script to temp file
+    printf "  Checking for updates..." >/dev/tty
+    local _tmp_file=""
+    _tmp_file=$(mktemp /tmp/tunnelforge-update.XXXXXX) || { log_error "Failed to create temp file"; return 1; }
+
+    if ! curl -sf --connect-timeout 10 --max-time 60 \
+        "https://raw.githubusercontent.com/${GITHUB_REPO}/main/tunnelforge.sh" \
+        -o "$_tmp_file" 2>/dev/null; then
+        printf "\r                          \r" >/dev/tty
+        log_error "Could not reach GitHub (check your internet connection)"
+        rm -f "$_tmp_file" 2>/dev/null || true
+        return 1
+    fi
+    printf "\r                          \r" >/dev/tty
+
+    # Compare SHA256 of installed vs remote
+    local _local_sha="" _remote_sha=""
+    _local_sha=$(sha256sum "$_script_path" 2>/dev/null | cut -d' ' -f1) || true
+    _remote_sha=$(sha256sum "$_tmp_file" 2>/dev/null | cut -d' ' -f1) || true
+
+    if [[ -z "$_remote_sha" ]] || [[ -z "$_local_sha" ]]; then
+        log_error "Failed to compute file checksums"
+        rm -f "$_tmp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    if [[ "$_local_sha" == "$_remote_sha" ]]; then
+        printf "  ${GREEN}Already up to date${RESET} ${DIM}(v%s)${RESET}\n\n" "$VERSION" >/dev/tty
+        rm -f "$_tmp_file" 2>/dev/null || true
+        return 0
+    fi
+
+    # Update available — show info and ask
+    local _remote_ver=""
+    _remote_ver=$(grep -oE 'readonly VERSION="[^"]+"' "$_tmp_file" 2>/dev/null \
+        | head -1 | grep -oE '"[^"]+"' | tr -d '"') || true
+
+    printf "  ${YELLOW}Update available${RESET}\n" >/dev/tty
+    if [[ -n "$_remote_ver" ]] && [[ "$_remote_ver" != "$VERSION" ]]; then
+        printf "    Installed : ${DIM}v%s${RESET}\n" "$VERSION" >/dev/tty
+        printf "    Latest    : ${BOLD}v%s${RESET}\n\n" "$_remote_ver" >/dev/tty
+    else
+        printf "    ${DIM}New changes available (v%s)${RESET}\n\n" "$VERSION" >/dev/tty
+    fi
+
+    if ! confirm_action "Install update?"; then
+        printf "\n  ${DIM}Update skipped.${RESET}\n\n" >/dev/tty
+        rm -f "$_tmp_file" 2>/dev/null || true
+        return 0
+    fi
+
+    # Validate downloaded script
+    if ! bash -n "$_tmp_file" 2>/dev/null; then
+        log_error "Downloaded file failed syntax check — aborting"
+        rm -f "$_tmp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    # Backup current script
+    if [[ -f "$_script_path" ]]; then
+        cp "$_script_path" "${_script_path}.bak" 2>/dev/null || true
+    fi
+
+    # Replace script
+    mv "$_tmp_file" "$_script_path" || { log_error "Failed to install update"; rm -f "$_tmp_file" 2>/dev/null || true; return 1; }
+    chmod +x "$_script_path" 2>/dev/null || true
+
+    if [[ -n "$_remote_ver" ]] && [[ "$_remote_ver" != "$VERSION" ]]; then
+        printf "\n  ${BOLD_GREEN}Updated successfully${RESET} ${DIM}(v%s → v%s)${RESET}\n" \
+            "$VERSION" "$_remote_ver" >/dev/tty
+    else
+        printf "\n  ${BOLD_GREEN}Updated successfully${RESET}\n" >/dev/tty
+    fi
+    printf "  ${DIM}Running tunnels are not affected.${RESET}\n" >/dev/tty
+    printf "  ${DIM}Previous version backed up to %s.bak${RESET}\n\n" "$_script_path" >/dev/tty
+    return 0
+}
+
 # ============================================================================
 # TELEGRAM NOTIFICATIONS  (Phase 6)
 # ============================================================================
@@ -6024,6 +6119,7 @@ ${BOLD}SYSTEM COMMANDS:${RESET}
     client-script <name> Generate client scripts (Linux + Windows)
     backup               Backup profiles + keys
     restore [file]       Restore from backup
+    update               Check for updates and install latest
     uninstall            Remove everything
     version              Show version
     help                 Show this help
@@ -8577,7 +8673,8 @@ show_menu() {
         printf "    ${CYAN}a${RESET}) ${BOLD}About${RESET}                      ${DIM}Version & info${RESET}\n" >/dev/tty
         printf "    ${CYAN}h${RESET}) ${BOLD}Help${RESET}                       ${DIM}CLI reference${RESET}\n" >/dev/tty
 
-        printf "\n    ${RED}u${RESET}) ${BOLD}Uninstall${RESET}                  ${DIM}Remove everything${RESET}\n" >/dev/tty
+        printf "\n    ${CYAN}w${RESET}) ${BOLD}Update${RESET}                     ${DIM}Check for updates${RESET}\n" >/dev/tty
+        printf "    ${RED}u${RESET}) ${BOLD}Uninstall${RESET}                  ${DIM}Remove everything${RESET}\n" >/dev/tty
         printf "    ${YELLOW}q${RESET}) ${BOLD}Quit${RESET}\n\n" >/dev/tty
 
         local _mm_choice
@@ -8607,6 +8704,7 @@ show_menu() {
             c|C) _menu_client_configs || true; _press_any_key ;;
             s|S) _menu_service_select || true ;;
             b|B) _menu_backup_restore || true ;;
+            w|W) update_tunnelforge || true; _press_any_key ;;
             u|U) if confirm_action "Uninstall TunnelForge completely?"; then
                      clear >/dev/tty 2>/dev/null || true
                      uninstall_tunnelforge || true
@@ -9971,6 +10069,9 @@ cli_main() {
             uninstall_tunnelforge ;;
         install)
             install_tunnelforge ;;
+        update)
+            detect_os; load_settings
+            update_tunnelforge ;;
 
         # ── Info commands ──
         version|-v|--version)
