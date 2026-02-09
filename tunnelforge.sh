@@ -3198,6 +3198,15 @@ _server_setup_sysctl() {
 }
 
 server_setup() {
+    local _profile_name="${1:-}"
+
+    # If a profile name is given, harden the REMOTE server via SSH
+    if [[ -n "$_profile_name" ]]; then
+        _server_setup_remote "$_profile_name"
+        return $?
+    fi
+
+    # Otherwise, harden THIS (local) server
     if [[ $EUID -ne 0 ]]; then
         log_error "Server setup requires root privileges"
         return 1
@@ -3226,6 +3235,134 @@ server_setup() {
     printf "${DIM}Your server is now hardened for SSH tunnel connections.${RESET}\n"
     printf "${DIM}Run 'tunnelforge audit' to verify security posture.${RESET}\n\n"
     return 0
+}
+
+# ── Remote Server Setup ──
+# SSHes into a profile's target server and enables essential tunnel settings
+
+_server_setup_remote() {
+    local name="$1"
+    local -A _rss_prof
+    if ! load_profile "$name" _rss_prof; then
+        log_error "Profile '${name}' not found"
+        return 1
+    fi
+
+    local host="${_rss_prof[SSH_HOST]:-}"
+    local user="${_rss_prof[SSH_USER]:-$(config_get SSH_DEFAULT_USER root)}"
+    if [[ -z "$host" ]]; then
+        log_error "Profile '${name}' has no SSH_HOST"
+        return 1
+    fi
+
+    printf "\n${BOLD_CYAN}═══ Remote Server Setup ═══${RESET}\n"
+    printf "${DIM}Target: %s@%s${RESET}\n\n" "$user" "$host"
+    printf "This will enable on the remote server:\n"
+    printf "  - AllowTcpForwarding yes    ${DIM}(required for -D/-L/-R)${RESET}\n"
+    printf "  - GatewayPorts clientspecified  ${DIM}(for -R public bind)${RESET}\n"
+    printf "  - PermitTunnel yes          ${DIM}(for TUN/TAP forwarding)${RESET}\n\n"
+
+    if ! confirm_action "SSH into ${host} and apply settings?"; then
+        log_info "Remote setup cancelled"
+        return 0
+    fi
+
+    _obfs_remote_ssh _rss_prof
+    local _rss_rc=0
+
+    "${_OBFS_SSH_CMD[@]}" "bash -s" <<'REMOTE_SSHD_SCRIPT' || _rss_rc=$?
+set -e
+
+# Use sudo if not root
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        if sudo -n true 2>/dev/null; then
+            SUDO="sudo"
+        else
+            echo "ERROR: Not root and sudo requires a password"
+            echo "  Either SSH as root, or add NOPASSWD for this user"
+            exit 1
+        fi
+    else
+        echo "ERROR: Not running as root and sudo not available"
+        exit 1
+    fi
+fi
+
+SSHD_CONFIG="/etc/ssh/sshd_config"
+if [ ! -f "$SSHD_CONFIG" ]; then
+    echo "ERROR: sshd_config not found at $SSHD_CONFIG"
+    exit 1
+fi
+
+# Backup before changes
+$SUDO cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%s)" 2>/dev/null || true
+
+CHANGED=false
+
+apply_setting() {
+    local key="$1" val="$2"
+    if grep -qE "^[[:space:]]*${key}[[:space:]]" "$SSHD_CONFIG" 2>/dev/null; then
+        CUR=$(grep -E "^[[:space:]]*${key}[[:space:]]" "$SSHD_CONFIG" | awk '{print $2}' | head -1)
+        if [ "$CUR" != "$val" ]; then
+            LN=$(grep -n "^[[:space:]]*${key}[[:space:]]" "$SSHD_CONFIG" | head -1 | cut -d: -f1)
+            $SUDO sed -i "${LN}s/.*/${key} ${val}/" "$SSHD_CONFIG"
+            echo "  ~ ${key}: ${CUR} -> ${val}"
+            CHANGED=true
+        else
+            echo "  OK ${key}: ${val} (already set)"
+        fi
+    elif grep -qE "^[[:space:]]*#[[:space:]]*${key}" "$SSHD_CONFIG" 2>/dev/null; then
+        LN=$(grep -n "^[[:space:]]*#[[:space:]]*${key}" "$SSHD_CONFIG" | head -1 | cut -d: -f1)
+        $SUDO sed -i "${LN}s/.*/${key} ${val}/" "$SSHD_CONFIG"
+        echo "  + ${key}: ${val} (uncommented)"
+        CHANGED=true
+    else
+        echo "${key} ${val}" | $SUDO tee -a "$SSHD_CONFIG" >/dev/null
+        echo "  + ${key}: ${val} (added)"
+        CHANGED=true
+    fi
+}
+
+echo "Checking sshd settings..."
+apply_setting "AllowTcpForwarding" "yes"
+apply_setting "GatewayPorts" "clientspecified"
+apply_setting "PermitTunnel" "yes"
+
+if [ "$CHANGED" = true ]; then
+    if $SUDO sshd -t 2>/dev/null; then
+        echo "sshd_config syntax OK"
+        if command -v systemctl >/dev/null 2>&1; then
+            $SUDO systemctl reload sshd 2>/dev/null || $SUDO systemctl reload ssh 2>/dev/null || true
+        else
+            $SUDO service sshd reload 2>/dev/null || $SUDO service ssh reload 2>/dev/null || true
+        fi
+        echo "SUCCESS: SSH daemon reloaded with new settings"
+    else
+        echo "ERROR: sshd_config syntax error — restoring backup"
+        LATEST_BAK=$(ls -t "${SSHD_CONFIG}.bak."* 2>/dev/null | head -1)
+        if [ -n "$LATEST_BAK" ]; then
+            $SUDO cp "$LATEST_BAK" "$SSHD_CONFIG" 2>/dev/null || true
+            echo "Restored from backup"
+        fi
+        exit 1
+    fi
+else
+    echo "All settings already correct — no changes needed"
+fi
+REMOTE_SSHD_SCRIPT
+
+    unset SSHPASS 2>/dev/null || true
+
+    if (( _rss_rc == 0 )); then
+        printf "\n"
+        log_success "Remote server configured for tunnel forwarding"
+    else
+        printf "\n"
+        log_error "Remote setup failed (exit code: ${_rss_rc})"
+    fi
+    return "$_rss_rc"
 }
 
 # ── TLS Obfuscation (stunnel) Setup ──
@@ -3275,18 +3412,39 @@ set -e
 OBFS_PORT="${obfs_port}"
 SSH_PORT="${ssh_port}"
 
+# Use sudo if not root
+SUDO=""
+if [ "\$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        # Verify sudo works without password (non-interactive session has no TTY)
+        if sudo -n true 2>/dev/null; then
+            SUDO="sudo"
+        else
+            echo "ERROR: Not root and sudo requires a password"
+            echo "  Either SSH as root, or add NOPASSWD for this user in /etc/sudoers"
+            exit 1
+        fi
+    else
+        echo "ERROR: Not running as root and sudo not available"
+        exit 1
+    fi
+fi
+
 # Detect package manager
 if command -v apt-get >/dev/null 2>&1; then
-    PKG_INSTALL="apt-get install -y -qq"
-    PKG_UPDATE="apt-get update -qq"
+    PKG_INSTALL="\$SUDO apt-get install -y -qq"
+    PKG_UPDATE="\$SUDO apt-get update -qq"
 elif command -v dnf >/dev/null 2>&1; then
-    PKG_INSTALL="dnf install -y -q"
+    PKG_INSTALL="\$SUDO dnf install -y -q"
     PKG_UPDATE="true"
 elif command -v yum >/dev/null 2>&1; then
-    PKG_INSTALL="yum install -y -q"
+    PKG_INSTALL="\$SUDO yum install -y -q"
     PKG_UPDATE="true"
+elif command -v apk >/dev/null 2>&1; then
+    PKG_INSTALL="\$SUDO apk add --quiet"
+    PKG_UPDATE="\$SUDO apk update --quiet"
 else
-    echo "ERROR: No supported package manager (apt/dnf/yum)"
+    echo "ERROR: No supported package manager (apt/dnf/yum/apk)"
     exit 1
 fi
 
@@ -3303,31 +3461,40 @@ if ss -tln 2>/dev/null | grep -qE ":\${OBFS_PORT}[[:space:]]"; then
     fi
 fi
 
-# Install
-echo "Installing stunnel and openssl..."
-\$PKG_UPDATE 2>/dev/null || true
-\$PKG_INSTALL stunnel4 2>/dev/null || \$PKG_INSTALL stunnel 2>/dev/null || {
-    echo "ERROR: Failed to install stunnel"
-    exit 1
-}
+# Install stunnel (skip if already present)
+if command -v stunnel >/dev/null 2>&1 || command -v stunnel4 >/dev/null 2>&1; then
+    echo "stunnel already installed"
+else
+    echo "Installing stunnel..."
+    \$PKG_UPDATE 2>/dev/null || true
+    # Try stunnel4 first (Debian/Ubuntu), then stunnel (RHEL/Alpine)
+    \$PKG_INSTALL stunnel4 >/dev/null 2>&1 || \$PKG_INSTALL stunnel >/dev/null 2>&1 || true
+    # Verify it actually installed
+    if ! command -v stunnel >/dev/null 2>&1 && ! command -v stunnel4 >/dev/null 2>&1; then
+        echo "ERROR: Failed to install stunnel"
+        echo "  Try manually: ssh into the server and install stunnel"
+        exit 1
+    fi
+    echo "stunnel installed"
+fi
 
 # Ensure openssl is available
-command -v openssl >/dev/null 2>&1 || \$PKG_INSTALL openssl 2>/dev/null || true
+command -v openssl >/dev/null 2>&1 || \$PKG_INSTALL openssl >/dev/null 2>&1 || true
 
 # Generate self-signed cert if missing
 CERT_DIR="/etc/stunnel"
 CERT_FILE="\${CERT_DIR}/tunnelforge.pem"
-mkdir -p "\$CERT_DIR"
+\$SUDO mkdir -p "\$CERT_DIR"
 
 if [ ! -f "\$CERT_FILE" ]; then
     echo "Generating self-signed TLS certificate..."
-    openssl req -new -x509 -days 3650 -nodes \
+    \$SUDO openssl req -new -x509 -days 3650 -nodes \
         -out "\$CERT_FILE" -keyout "\$CERT_FILE" \
         -subj "/CN=tunnelforge/O=TunnelForge/C=US" 2>/dev/null || {
         echo "ERROR: Failed to generate certificate"
         exit 1
     }
-    chmod 600 "\$CERT_FILE"
+    \$SUDO chmod 600 "\$CERT_FILE"
     echo "Certificate generated: \$CERT_FILE"
 else
     echo "Certificate exists: \$CERT_FILE"
@@ -3335,7 +3502,7 @@ fi
 
 # Write stunnel config
 CONF_FILE="\${CERT_DIR}/tunnelforge-ssh.conf"
-cat > "\$CONF_FILE" <<STUNNEL_CONF
+\$SUDO tee "\$CONF_FILE" >/dev/null <<STUNNEL_CONF
 ; TunnelForge SSH obfuscation — wraps SSH in TLS
 pid = /var/run/stunnel-tunnelforge.pid
 [ssh-tls]
@@ -3355,25 +3522,25 @@ if command -v systemctl >/dev/null 2>&1; then
         fi
     done
     if [ -n "\$SVC" ]; then
-        systemctl enable "\$SVC" 2>/dev/null || true
-        systemctl restart "\$SVC" 2>/dev/null || true
+        \$SUDO systemctl enable "\$SVC" 2>/dev/null || true
+        \$SUDO systemctl restart "\$SVC" 2>/dev/null || true
         echo "Stunnel service restarted (\${SVC})"
     else
-        stunnel "\$CONF_FILE" 2>/dev/null || { echo "ERROR: stunnel failed to start"; exit 1; }
+        \$SUDO stunnel "\$CONF_FILE" 2>/dev/null || { echo "ERROR: stunnel failed to start"; exit 1; }
         echo "Stunnel started directly"
     fi
 else
-    stunnel "\$CONF_FILE" 2>/dev/null || { echo "ERROR: stunnel failed to start"; exit 1; }
+    \$SUDO stunnel "\$CONF_FILE" 2>/dev/null || { echo "ERROR: stunnel failed to start"; exit 1; }
     echo "Stunnel started"
 fi
 
 # Open firewall port
 if command -v ufw >/dev/null 2>&1; then
-    ufw allow "\${OBFS_PORT}/tcp" 2>/dev/null || true
+    \$SUDO ufw allow "\${OBFS_PORT}/tcp" 2>/dev/null || true
     echo "UFW: port \${OBFS_PORT} opened"
 elif command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port="\${OBFS_PORT}/tcp" 2>/dev/null || true
-    firewall-cmd --reload 2>/dev/null || true
+    \$SUDO firewall-cmd --permanent --add-port="\${OBFS_PORT}/tcp" 2>/dev/null || true
+    \$SUDO firewall-cmd --reload 2>/dev/null || true
     echo "firewalld: port \${OBFS_PORT} opened"
 fi
 
@@ -6113,7 +6280,8 @@ ${BOLD}SYSTEM COMMANDS:${RESET}
     menu                 Interactive TUI menu
     install              Install TunnelForge
     health               Run health check
-    server-setup         Harden server for receiving tunnels
+    server-setup         Harden local server for tunnels
+    server-setup <name>  Enable forwarding on remote server
     obfs-setup <name>    Set up TLS obfuscation (stunnel) on server
     client-config <name> Show client connection config (TLS+PSK)
     client-script <name> Generate client scripts (Linux + Windows)
@@ -7102,7 +7270,7 @@ wizard_create_profile() {
                     printf "    SOCKS Host: ${BOLD}%s${RESET}  Port: ${BOLD}%s${RESET}\n" "$_wn_bind" "$_wn_lport" >/dev/tty
                     printf "    Select SOCKS v5, enable Proxy DNS\n\n" >/dev/tty
                     printf "  ${DIM}Test from command line:${RESET}\n" >/dev/tty
-                    printf "    curl --socks5 %s:%s https://ifconfig.me\n\n" "$_wn_bind" "$_wn_lport" >/dev/tty
+                    printf "    curl --socks5-hostname %s:%s https://ifconfig.me\n\n" "$_wn_bind" "$_wn_lport" >/dev/tty
                     if [[ "$_wn_bind" == "0.0.0.0" ]]; then
                         printf "  ${DIM}From other devices on your LAN, use${RESET}\n" >/dev/tty
                         printf "  ${DIM}this machine's IP instead of 0.0.0.0${RESET}\n\n" >/dev/tty
@@ -8006,12 +8174,12 @@ _scenario_socks5() {
 
   TEST IT WORKS:
     From the command line:
-      curl --socks5 127.0.0.1:1080 https://ifconfig.me
+      curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
     → Should show your VPS IP, not your real IP
 
     If you used 0.0.0.0 as bind, other devices on your
     LAN can use it too:
-      curl --socks5 <server-lan-ip>:1080 https://ifconfig.me
+      curl --socks5-hostname <server-lan-ip>:1080 https://ifconfig.me
 
 EOF
     _press_any_key
@@ -8194,7 +8362,7 @@ _scenario_jump_host() {
   AFTER TUNNEL STARTS:
     SOCKS5 mode:
       Set browser proxy to 127.0.0.1:1080
-      curl --socks5 127.0.0.1:1080 https://ifconfig.me
+      curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 
     Local Forward mode:
       Open http://127.0.0.1:8080 in your browser
@@ -8260,7 +8428,7 @@ _scenario_tls_single_vps() {
 '' \
 '  AFTER TUNNEL STARTS:' \
 '    Set browser SOCKS5 proxy: 127.0.0.1:1080' \
-'    Test: curl --socks5 127.0.0.1:1080 https://ifconfig.me' \
+'    Test: curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me' \
 '    → Should show VPS IP' \
 '' \
 '  WHAT DPI SEES:' \
@@ -10022,7 +10190,7 @@ cli_main() {
             load_settings; security_audit || true ;;
         server-setup)
             detect_os; load_settings
-            server_setup || true ;;
+            server_setup "${1:-}" || true ;;
         obfs-setup|obfuscate)
             [[ -z "${1:-}" ]] && { log_error "Usage: tunnelforge obfs-setup <profile>"; return 1; }
             detect_os; load_settings
